@@ -16,6 +16,13 @@ dependencies = [
   "uvicorn[standard]>=0.30.0",
 ]
 
+[project.optional-dependencies.tts]
+gemini = [
+  "google-genai>=0.3.0",
+  "sounddevice>=0.4.6",
+  "numpy>=1.26.0",
+]
+
 [project.optional-dependencies]
 dev = [
   "pytest>=8.0.0",
