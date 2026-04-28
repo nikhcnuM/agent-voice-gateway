@@ -504,3 +504,48 @@ async def test_tts_not_invoked_on_empty_assistant_text(tmp_path: Path):
     service._dispatch_tts("")
     assert service._pending_tts_tasks == []
     assert tts.calls == []
+
+
+class CrashingCommandBus(FakeBus):
+    """Bus whose handler always raises an unexpected error on the first command."""
+
+    def __init__(self, command):
+        super().__init__()
+        self.commands.append(command)
+
+
+@pytest.mark.anyio
+async def test_bus_consumer_does_not_ack_on_handler_crash(tmp_path: Path):
+    """A handler crash must leave the message unacked so pending-recovery can retry."""
+    _, service, recorder, _, _, _ = build_client(tmp_path)
+    bus = CrashingCommandBus(
+        SimpleNamespace(
+            stream_id="crash-0",
+            envelope=SimpleNamespace(
+                type="voice.ptt.start",
+                target="agent-voice-gateway",
+                payload={},
+                correlation_id="c1",
+                session_id="ptt-1",
+            ),
+        )
+    )
+    service.agent_bus = bus
+    # Make the handler crash by removing the recorder so start_ptt blows up
+    service.recorder = None  # type: ignore[assignment]
+    service.config.agent_bus.poll_interval_seconds = 0.01
+
+    task = asyncio.create_task(_consume_bus_commands(service))
+    try:
+        for _ in range(30):
+            await asyncio.sleep(0.01)
+            if bus.acks:
+                break
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    # Handler raised, so the message must NOT be in any ack batch
+    acked = [sid for batch in bus.acks for sid in batch]
+    assert "crash-0" not in acked
