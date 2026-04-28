@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 from fastapi import FastAPI, HTTPException, Request, status
 
 from voice_gateway.audio import FfmpegRecorder
-from voice_gateway.bus import AgentBusClient
+from voice_gateway.bus import AgentBusClient, AgentBusError
 from voice_gateway.config import GatewayConfig, load_config
 from voice_gateway.hermes import HermesClient
 from voice_gateway.launchpad import LaunchpadBridgeClient
@@ -18,6 +19,8 @@ from voice_gateway.service import (
 )
 from voice_gateway.transcriber import WhisperCliTranscriber
 from voice_gateway.tts import GeminiTtsClient
+
+logger = logging.getLogger(__name__)
 
 
 def create_app(config: GatewayConfig | None = None, service: GatewayService | None = None) -> FastAPI:
@@ -64,24 +67,6 @@ def create_app(config: GatewayConfig | None = None, service: GatewayService | No
             tts=config.tts.provider if config.tts.enabled else "disabled",
         )
 
-    @app.post("/ptt/start")
-    async def ptt_start(request: Request):
-        return await gateway(request).start_ptt()
-
-    @app.post("/ptt/stop")
-    async def ptt_stop(request: Request):
-        try:
-            return await gateway(request).stop_ptt()
-        except ActiveSessionMissing as exc:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
-
-    @app.post("/ptt/cancel")
-    async def ptt_cancel(request: Request):
-        try:
-            return await gateway(request).cancel_ptt()
-        except ActiveSessionMissing as exc:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
-
     @app.post("/launchpad/options/{session_id}/response")
     async def launchpad_option_response(
         session_id: str,
@@ -113,16 +98,32 @@ def gateway(request: Request) -> GatewayService:
 
 async def _consume_bus_commands(service: GatewayService) -> None:
     assert service.agent_bus is not None
+    backoff_seconds = max(service.config.agent_bus.poll_interval_seconds, 0.2)
     while True:
-        messages = await service.agent_bus.consume_commands(count=10)
+        try:
+            messages = await service.agent_bus.consume_commands(count=10)
+        except AgentBusError as exc:
+            logger.warning("agent_bus_consume_failed error=%s", exc)
+            await asyncio.sleep(backoff_seconds)
+            continue
+
         ack_ids: list[str] = []
         for message in messages:
             try:
                 await service.handle_bus_command(message.envelope)
             except ActiveSessionMissing:
-                pass
-            ack_ids.append(message.stream_id)
-        await service.agent_bus.ack_commands(ack_ids)
+                logger.warning("agent_bus_command_discarded stream_id=%s reason=active_session_missing", message.stream_id)
+                ack_ids.append(message.stream_id)
+            except Exception as exc:  # noqa: BLE001 - keep consumer alive; leave unacked for retry/recovery
+                logger.warning("agent_bus_command_failed stream_id=%s error=%s", message.stream_id, exc)
+            else:
+                ack_ids.append(message.stream_id)
+        try:
+            await service.agent_bus.ack_commands(ack_ids)
+        except AgentBusError as exc:
+            logger.warning("agent_bus_ack_failed error=%s", exc)
+            await asyncio.sleep(backoff_seconds)
+            continue
         await asyncio.sleep(service.config.agent_bus.poll_interval_seconds)
 
 
