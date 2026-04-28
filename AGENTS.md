@@ -20,7 +20,8 @@ This repo is one child repo inside the multi-repo workspace at
 It intentionally does **not** call Hermes in the primary architecture. Hermes is
 owned by the live companion app in `../mac-widget-hermes`.
 
-HTTP `/ptt/*` endpoints remain for manual/debug usage, but the main flow is:
+HTTP `/ptt/*` endpoints are intentionally removed. PTT is only driven by
+`agent-bus` commands:
 
 ```text
 agent-bus command voice.ptt.start
@@ -43,7 +44,7 @@ agent-bus command voice.tts.speak
 All source lives under `src/voice_gateway/`.
 
 - `app.py`
-  - FastAPI app, debug HTTP routes, startup/shutdown bus consumer task.
+  - FastAPI app, health/options HTTP routes, startup/shutdown bus consumer task.
 - `service.py`
   - `GatewayService`, PTT state machine, event publication, bus command handlers,
     TTS command execution.
