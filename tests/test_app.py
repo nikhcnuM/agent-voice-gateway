@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import struct
 import wave
 from pathlib import Path
@@ -8,12 +9,13 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 
-from voice_gateway.app import create_app
+from voice_gateway.app import _consume_bus_commands, create_app
+from voice_gateway.bus import AgentBusError
 from voice_gateway.config import GatewayConfig
 from voice_gateway.hermes import HermesError
 from voice_gateway.launchpad import LaunchpadBridgeError
 from voice_gateway.models import AgentOption, HermesResult
-from voice_gateway.service import GatewayService
+from voice_gateway.service import ActiveSessionMissing, GatewayService
 
 
 class FakeRecorder:
@@ -89,9 +91,30 @@ class FakeTts:
 class FakeBus:
     def __init__(self):
         self.events = []
+        self.commands = []
+        self.acks = []
 
     async def publish_event(self, envelope) -> None:
         self.events.append(envelope)
+
+    async def consume_commands(self, count: int = 10):
+        commands, self.commands = self.commands[:count], self.commands[count:]
+        return commands
+
+    async def ack_commands(self, stream_ids: list[str]) -> None:
+        self.acks.append(stream_ids)
+
+
+class FlakyCommandBus(FakeBus):
+    def __init__(self):
+        super().__init__()
+        self.fail_next_consume = True
+
+    async def consume_commands(self, count: int = 10):
+        if self.fail_next_consume:
+            self.fail_next_consume = False
+            raise AgentBusError("bus temporarily unavailable")
+        return await super().consume_commands(count=count)
 
 
 def build_client(tmp_path: Path, transcript: str = "Run the tests", result: HermesResult | None = None, tts: FakeTts | None = None):
@@ -127,36 +150,43 @@ def test_health_reports_configured_dependencies(tmp_path: Path):
     assert response.json()["tts"] == "disabled"
 
 
-def test_start_is_idempotent_while_recording(tmp_path: Path):
-    client, _, recorder, _, _, _ = build_client(tmp_path)
+def test_ptt_http_routes_are_removed(tmp_path: Path):
+    client, *_ = build_client(tmp_path)
 
-    first = client.post("/ptt/start")
-    second = client.post("/ptt/start")
+    assert client.post("/ptt/start").status_code == 404
+    assert client.post("/ptt/stop").status_code == 404
+    assert client.post("/ptt/cancel").status_code == 404
 
-    assert first.status_code == 200
-    assert second.status_code == 200
-    assert first.json()["session_id"] == second.json()["session_id"]
+
+@pytest.mark.anyio
+async def test_start_is_idempotent_while_recording(tmp_path: Path):
+    _, service, recorder, _, _, _ = build_client(tmp_path)
+
+    first = await service.start_ptt()
+    second = await service.start_ptt()
+
+    assert first.session_id == second.session_id
     assert recorder.starts == 1
 
 
-def test_stop_without_start_returns_409(tmp_path: Path):
-    client, *_ = build_client(tmp_path)
+@pytest.mark.anyio
+async def test_stop_without_start_raises_controlled_error(tmp_path: Path):
+    _, service, *_ = build_client(tmp_path)
 
-    response = client.post("/ptt/stop")
+    with pytest.raises(ActiveSessionMissing):
+        await service.stop_ptt()
 
-    assert response.status_code == 409
 
+@pytest.mark.anyio
+async def test_ptt_stop_transcribes_and_publishes_bus_event(tmp_path: Path):
+    _, service, recorder, hermes, launchpad, bus = build_client(tmp_path)
 
-def test_ptt_stop_transcribes_and_publishes_bus_event(tmp_path: Path):
-    client, _, recorder, hermes, launchpad, bus = build_client(tmp_path)
+    start = await service.start_ptt()
+    response = await service.stop_ptt()
 
-    start = client.post("/ptt/start")
-    response = client.post("/ptt/stop")
-
-    assert response.status_code == 200
-    assert response.json()["session_id"] == start.json()["session_id"]
-    assert response.json()["status"] == "transcribed"
-    assert response.json()["transcript"] == "Run the tests"
+    assert response.session_id == start.session_id
+    assert response.status == "transcribed"
+    assert response.transcript == "Run the tests"
     assert recorder.stops == 1
     assert hermes.transcripts == []
     assert launchpad.sessions == []
@@ -167,23 +197,22 @@ def test_ptt_stop_transcribes_and_publishes_bus_event(tmp_path: Path):
     ]
 
 
-def test_transcription_response_does_not_depend_on_launchpad_bridge(tmp_path: Path):
+@pytest.mark.anyio
+async def test_transcription_response_does_not_depend_on_launchpad_bridge(tmp_path: Path):
     config = GatewayConfig()
     recorder = FakeRecorder(tmp_path)
     transcriber = FakeTranscriber("resume la build")
     hermes = FakeHermes(HermesResult(response_id="resp_123", assistant_text="Build lista."))
     launchpad = FailingLaunchpad()
     service = GatewayService(config, recorder, transcriber, hermes, launchpad)
-    client = TestClient(create_app(config=config, service=service))
 
-    client.post("/ptt/start")
-    response = client.post("/ptt/stop")
+    await service.start_ptt()
+    response = await service.stop_ptt()
 
-    assert response.status_code == 200
-    assert response.json()["status"] == "transcribed"
-    assert response.json()["transcript"] == "resume la build"
-    assert response.json()["assistant_text"] is None
-    assert response.json()["detail"] is None
+    assert response.status == "transcribed"
+    assert response.transcript == "resume la build"
+    assert response.assistant_text is None
+    assert response.detail is None
 
 
 def test_bus_tts_command_invokes_tts_and_publishes_status(tmp_path: Path):
@@ -201,71 +230,129 @@ def test_bus_tts_command_invokes_tts_and_publishes_status(tmp_path: Path):
     assert [event.type for event in bus.events] == ["voice.tts.started", "voice.tts.completed"]
 
 
-def test_empty_transcript_does_not_call_hermes(tmp_path: Path):
-    client, _, _, hermes, launchpad, _ = build_client(tmp_path, transcript="")
+@pytest.mark.anyio
+async def test_bus_ptt_commands_start_stop_and_cancel(tmp_path: Path):
+    _, service, recorder, _, _, bus = build_client(tmp_path)
 
-    client.post("/ptt/start")
-    response = client.post("/ptt/stop")
+    await service.handle_bus_command(
+        SimpleNamespace(type="voice.ptt.start", target="agent-voice-gateway", payload={}, correlation_id="c1", session_id=None)
+    )
+    assert service.active_recording is not None
+    assert recorder.starts == 1
 
-    assert response.status_code == 200
-    assert response.json()["status"] == "empty_transcript"
+    await service.handle_bus_command(
+        SimpleNamespace(type="voice.ptt.stop", target="agent-voice-gateway", payload={}, correlation_id="c1", session_id=None)
+    )
+    assert service.active_recording is None
+    assert recorder.stops == 1
+    assert "voice.transcription.completed" in [event.type for event in bus.events]
+
+    await service.handle_bus_command(
+        SimpleNamespace(type="voice.ptt.start", target="agent-voice-gateway", payload={}, correlation_id="c2", session_id=None)
+    )
+    await service.handle_bus_command(
+        SimpleNamespace(type="voice.ptt.cancel", target="agent-voice-gateway", payload={}, correlation_id="c2", session_id=None)
+    )
+    assert recorder.cancels == 1
+
+
+@pytest.mark.anyio
+async def test_bus_command_for_other_target_is_ignored(tmp_path: Path):
+    _, service, recorder, _, _, _ = build_client(tmp_path)
+
+    await service.handle_bus_command(
+        SimpleNamespace(type="voice.ptt.start", target="other-service", payload={}, correlation_id="c1", session_id=None)
+    )
+
+    assert recorder.starts == 0
+
+
+@pytest.mark.anyio
+async def test_bus_consumer_survives_temporary_consume_error(tmp_path: Path):
+    _, service, _, _, _, _ = build_client(tmp_path)
+    bus = FlakyCommandBus()
+    bus.commands.append(
+        SimpleNamespace(
+            stream_id="1-0",
+            envelope=SimpleNamespace(type="voice.ptt.start", target="other-service", payload={}, correlation_id="c1", session_id=None),
+        )
+    )
+    service.agent_bus = bus
+    service.config.agent_bus.poll_interval_seconds = 0.01
+
+    task = asyncio.create_task(_consume_bus_commands(service))
+    try:
+        for _ in range(50):
+            if bus.acks:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert bus.fail_next_consume is False
+    assert bus.acks == [["1-0"]]
+
+
+@pytest.mark.anyio
+async def test_empty_transcript_does_not_call_hermes(tmp_path: Path):
+    _, service, _, hermes, launchpad, _ = build_client(tmp_path, transcript="")
+
+    await service.start_ptt()
+    response = await service.stop_ptt()
+
+    assert response.status == "empty_transcript"
     assert hermes.transcripts == []
     assert launchpad.sessions[-1].status == "needs_attention"
 
 
-def test_quiet_audio_does_not_call_whisper_or_hermes(tmp_path: Path):
+@pytest.mark.anyio
+async def test_quiet_audio_does_not_call_whisper_or_hermes(tmp_path: Path):
     config = GatewayConfig()
     recorder = FakeRecorder(tmp_path)
     transcriber = FakeTranscriber("Gracias por ver el video.")
     hermes = FakeHermes()
     launchpad = FakeLaunchpad()
     service = GatewayService(config, recorder, transcriber, hermes, launchpad)
-    client = TestClient(create_app(config=config, service=service))
 
-    start = client.post("/ptt/start")
-    write_test_wav(tmp_path / f"{start.json()['session_id']}.wav", amplitude=1)
-    response = client.post("/ptt/stop")
+    start = await service.start_ptt()
+    write_test_wav(tmp_path / f"{start.session_id}.wav", amplitude=1)
+    response = await service.stop_ptt()
 
-    assert response.status_code == 200
-    assert response.json()["status"] == "empty_transcript"
-    assert "rms=" in response.json()["detail"]
+    assert response.status == "empty_transcript"
+    assert response.detail is not None
+    assert "rms=" in response.detail
     assert hermes.transcripts == []
 
 
-def test_hermes_is_not_called_by_voice_gateway(tmp_path: Path):
+@pytest.mark.anyio
+async def test_hermes_is_not_called_by_voice_gateway(tmp_path: Path):
     config = GatewayConfig()
     recorder = FakeRecorder(tmp_path)
     transcriber = FakeTranscriber("enciende las luces")
     hermes = FailingHermes()
     launchpad = FakeLaunchpad()
     service = GatewayService(config, recorder, transcriber, hermes, launchpad)
-    client = TestClient(create_app(config=config, service=service))
 
-    client.post("/ptt/start")
-    response = client.post("/ptt/stop")
+    await service.start_ptt()
+    response = await service.stop_ptt()
 
-    assert response.status_code == 200
-    assert response.json()["status"] == "transcribed"
-    assert response.json()["transcript"] == "enciende las luces"
-    assert response.json()["detail"] is None
+    assert response.status == "transcribed"
+    assert response.transcript == "enciende las luces"
+    assert response.detail is None
     assert launchpad.sessions == []
 
 
-def test_cancel_discards_active_recording(tmp_path: Path):
-    client, _, recorder, _, _, _ = build_client(tmp_path)
+@pytest.mark.anyio
+async def test_cancel_discards_active_recording(tmp_path: Path):
+    _, service, recorder, _, _, _ = build_client(tmp_path)
 
-    start = client.post("/ptt/start")
-    response = client.post("/ptt/cancel")
+    start = await service.start_ptt()
+    response = await service.cancel_ptt()
 
-    assert response.status_code == 200
-    assert response.json() == {
-        "session_id": start.json()["session_id"],
-        "status": "cancelled",
-        "transcript": None,
-        "hermes_response_id": None,
-        "assistant_text": None,
-        "detail": None,
-    }
+    assert response.session_id == start.session_id
+    assert response.status == "cancelled"
     assert recorder.cancels == 1
 
 
