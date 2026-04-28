@@ -56,8 +56,33 @@ class LaunchpadBridgeConfig(BaseModel):
     completed_ack_option: bool = False
 
 
+class AgentBusConfig(BaseModel):
+    enabled: bool = False
+    base_url: str = "http://127.0.0.1:8790"
+    group: str = "agent-voice-gateway"
+    consumer: str = "voice-gateway"
+    poll_interval_seconds: float = 0.2
+
+
 class TtsConfig(BaseModel):
     enabled: bool = False
+    provider: str = "gemini"
+    model: str = "gemini-2.5-flash-preview-tts"
+    voice: str = "Kore"
+    language: str = "es-ES"
+    api_key_env: list[str] = Field(
+        default_factory=lambda: ["GEMINI_API_KEY", "GOOGLE_API_KEY"]
+    )
+    output_device: str | int | None = None
+    sample_rate: int = 24000
+    auto_play: bool = True
+
+    def api_key(self) -> str | None:
+        for env_name in self.api_key_env:
+            value = os.getenv(env_name)
+            if value:
+                return value
+        return None
 
 
 class GatewayConfig(BaseModel):
@@ -66,6 +91,7 @@ class GatewayConfig(BaseModel):
     whisper: WhisperConfig = Field(default_factory=WhisperConfig)
     hermes: HermesConfig = Field(default_factory=HermesConfig)
     launchpad_bridge: LaunchpadBridgeConfig = Field(default_factory=LaunchpadBridgeConfig)
+    agent_bus: AgentBusConfig = Field(default_factory=AgentBusConfig)
     tts: TtsConfig = Field(default_factory=TtsConfig)
 
 
