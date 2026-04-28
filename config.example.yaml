@@ -1,0 +1,60 @@
+server:
+  host: 127.0.0.1
+  port: 8788
+
+audio:
+  input_device: default
+  sample_rate: 16000
+  channels: 1
+  temp_dir: /tmp/launchpad-voice
+  max_duration_seconds: 60
+  min_rms: 0.003
+  min_peak: 0.02
+  keep_temp_files: false
+  ffmpeg_binary: ffmpeg
+  ffmpeg_input_args:
+    - -f
+    - avfoundation
+    - -i
+    - :default
+
+whisper:
+  binary: .deps/whisper.cpp/build/bin/whisper-cli
+  model: models/whisper-large-v3-turbo-es-ggml/ggml-model.bin
+  language: es
+  threads: 4
+  extra_args:
+    - -ng
+
+hermes:
+  base_url: http://127.0.0.1:8642/v1
+  model: hermes-agent
+  api_key_env:
+    - HERMES_API_KEY
+    - API_SERVER_KEY
+  conversation: launchpad-voice
+
+launchpad_bridge:
+  base_url: http://127.0.0.1:8765
+  publish_alerts: true
+  completed_ack_option: false
+
+agent_bus:
+  enabled: true
+  base_url: http://127.0.0.1:8790
+  group: agent-voice-gateway
+  consumer: voice-gateway
+  poll_interval_seconds: 0.2
+
+tts:
+  enabled: false
+  provider: gemini
+  model: gemini-2.5-flash-preview-tts
+  voice: Kore
+  language: es-ES
+  api_key_env:
+    - GEMINI_API_KEY
+    - GOOGLE_API_KEY
+  # output_device: null  # null = sistema; entero o nombre de dispositivo sounddevice
+  sample_rate: 24000
+  auto_play: true
